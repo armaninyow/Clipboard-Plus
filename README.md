@@ -1,6 +1,6 @@
 # 📋 Clipboard Plus
 
-
+![](https://raw.githubusercontent.com/armaninyow/Clipboard-Plus/refs/heads/main/image.png)
 
 Clipboard Plus is a modern clipboard history manager for Windows. Replaces the default Win+V clipboard with a dark-themed, scrollable history panel that supports rich text, images, pinning, and persistent storage across restarts.
 
