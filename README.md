@@ -58,12 +58,13 @@ Open the ⚙️ settings panel from the toolbar:
 The following files and folders are created next to the `.exe` on first run:
 
 ```
-ClipboardPlus.exe
-ClipboardManager.ini        ← settings and text history
-ClipboardData\
-├── 1.clip, 2.clip, ...     ← full clipboard data per item
-└── Thumbs\
-    └── 1.png, 2.png, ...   ← image thumbnails
+Main Folder
+├── ClipboardPlus.exe
+├── ClipboardManager.ini        ← settings and text history
+└── ClipboardData\
+    ├── 1.clip, 2.clip, ...     ← full clipboard data per item
+    └── Thumbs\
+        └── 1.png, 2.png, ...   ← image thumbnails
 ```
 
 ---
