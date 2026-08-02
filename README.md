@@ -1,6 +1,6 @@
 # 📋 Clipboard Plus
 
-![](https://raw.githubusercontent.com/armaninyow/Clipboard-Plus/refs/heads/main/sample.png)
+[![](https://raw.githubusercontent.com/armaninyow/Clipboard-Plus/refs/heads/main/sample.png)](https://raw.githubusercontent.com/armaninyow/Clipboard-Plus/refs/heads/main/sample.png)
 
 Clipboard Plus is a modern clipboard history manager for Windows. Replaces the default Win+V clipboard with a dark-themed, scrollable history panel that supports rich text, images, pinning, and persistent storage across restarts.
 
@@ -15,29 +15,31 @@ Clipboard Plus is a modern clipboard history manager for Windows. Replaces the d
 - **Plain Text Mode**: optionally strip formatting and paste as plain text only
 - **Pin items**: pin important entries so they survive "Clear All" and stay at the top when filtering
 - **Show Only Pinned**: filter the list to pinned items only
-- **Expand / Collapse**: expand long text entries to see the full content
+- **Expand / Collapse**: expand long text entries to see the full content, including single long words or links that wrap cleanly instead of running off the window
+- **Hover highlights**: items and buttons light up on hover so it's clear what's clickable, with the expand/collapse button highlighting independently from the rest of the card
+- **Backup & Restore**: export your full clipboard history (pinned and unpinned, including images) to a single backup file, and import it back later or on another machine
 - **Persistent history**: clipboard history, images, and settings are saved to disk and restored on next launch
 - **Multi-monitor aware**: window opens at the cursor and flips to stay on screen near edges
 - **Resizable window**: drag to resize; items reflow automatically
 - **Context menu**: right-click any item to Pin/Unpin, Delete, Expand/Collapse, Move Up/Down
-- **Settings**: Plain Text Mode, Keep Open After Paste, Max Items (1–200)
+- **Settings**: Plain Text Mode, Keep Open After Paste, Max Items (1–200), Export/Import Backup
 - **Dark theme**: clean dark UI throughout
 
 ---
 
 ## Usage
 
-| Action | Result |
-|---|---|
-| `Win+V` | Open / close the clipboard panel |
-| Click an item | Paste it into the active window |
-| Right-click an item | Pin, Delete, Expand/Collapse, Move Up/Down |
-| `📌` button | Toggle Show Only Pinned |
-| `❌` button | Clear all unpinned items (with confirmation) |
-| `⚙️` button | Open Settings |
-| `🪟` button | Open Windows 11 native clipboard |
-| Scroll wheel | Scroll through history |
-| Resize window | Items reflow to new width |
+| Action              | Result                                       |
+| ------------------- | -------------------------------------------- |
+| `Win+V`             | Open / close the clipboard panel             |
+| Click an item       | Paste it into the active window              |
+| Right-click an item | Pin, Delete, Expand/Collapse, Move Up/Down   |
+| `📌` button          | Toggle Show Only Pinned                      |
+| `❌` button          | Clear all unpinned items (with confirmation) |
+| `⚙️` button         | Open Settings                                |
+| `🪟` button          | Open Windows 11 native clipboard             |
+| Scroll wheel        | Scroll through history                       |
+| Resize window       | Items reflow to new width                    |
 
 ---
 
@@ -45,11 +47,13 @@ Clipboard Plus is a modern clipboard history manager for Windows. Replaces the d
 
 Open the ⚙️ settings panel from the toolbar:
 
-| Setting | Description |
-|---|---|
-| **Plain Text Mode** | Strip all formatting; always paste as plain text |
-| **Keep Open After Paste** | Don't hide the panel after clicking an item |
-| **Max Items** | Maximum number of clipboard entries to keep (1–200, default 25) |
+| Setting                   | Description                                                                 |
+| ------------------------- | ---------------------------------------------------------------------------- |
+| **Plain Text Mode**       | Strip all formatting; always paste as plain text                             |
+| **Keep Open After Paste** | Don't hide the panel after clicking an item                                  |
+| **Max Items**             | Maximum number of clipboard entries to keep (1–200, default 25)              |
+| **Export Backup**         | Save your entire clipboard history — pinned and unpinned, including images — to a `.zip` backup file |
+| **Import Backup**         | Restore clipboard history from a previously exported `.zip` backup, replacing your current items and pins |
 
 ---
 
@@ -63,6 +67,7 @@ Main Folder
 ├── ClipboardManager.ini        ← settings and text history
 └── ClipboardData\
     ├── 1.clip, 2.clip, ...     ← full clipboard data per item
+    ├── 1.txt, 2.txt, ...       ← full text per item
     └── Thumbs\
         └── 1.png, 2.png, ...   ← image thumbnails
 ```
@@ -80,14 +85,15 @@ No installer needed. No external files required.
 
 ## Requirements
 
-* **Operating System**: Windows 10 or Windows 11.
-* **Standalone**: No installation or external assets required.
+- **Operating System**: Windows 10 or Windows 11.
+- **Standalone**: No installation or external assets required.
 
 ---
 
 ## License
 
 ### CC0 1.0 Universal
-This project is licensed under the **Creative Commons Legal Code CC0 1.0 Universal**. 
+
+This project is licensed under the **Creative Commons Legal Code CC0 1.0 Universal**.
 
 To the extent possible under law, the author(s) have dedicated all copyright and related and neighboring rights to this software to the public domain worldwide. This software is distributed without any warranty.
