@@ -4,7 +4,7 @@
 Persistent
 
 ; ============================================================
-;  CLIPBOARD PLUS  |  AHK v2  |  Hotkey: Win+V
+;  CLIPBOARD PLUS v1.1  |  AHK v2  |  Hotkey: Win+V
 ;  Custom drawn items inside a child-Gui scroll viewport
 ;  Child Gui clips its own children — menu bar never overlapped
 ;  Settings + history persisted to ClipboardManager.ini
@@ -15,6 +15,7 @@ global INI_FILE      := A_ScriptDir "\ClipboardManager.ini"
 global CLIP_DIR      := A_ScriptDir "\ClipboardData"
 global THUMB_DIR     := A_ScriptDir "\ClipboardData\Thumbs"
 global MaxItems      := 25
+global MAX_CLIP_BYTES := 8 * 1024 * 1024   ; 8MB cap on ClipboardAll() capture; beyond this, store plain text only
 global PlainTextMode := false
 global KeepOpen      := false
 global ShowPinned    := false
@@ -48,6 +49,10 @@ global LIST_TOP  := 0    ; set after chrome built = MENUBAR_H + SEP_H
 global ITEM_PAD  := 10
 global MIN_ITEM_H := 36
 global MAX_ITEM_H := 85
+global MAX_EXPANDED_CHARS := 700   ; hard backstop for expanded view, independent of line-count estimate
+global HoveredItemId := 0
+global HoveredExpandBtnId := 0
+global HoveredHeaderBtn := ""
 
 ; ============================================================
 ;  INI  — LOAD / SAVE
@@ -63,14 +68,23 @@ LoadConfig() {
         DirCreate(CLIP_DIR)
     if !DirExist(THUMB_DIR)
         DirCreate(THUMB_DIR)
+    ClipHistory := []
     count := 0
     try count := Integer(IniRead(INI_FILE, "History", "Count", 0))
     Loop count {
         try {
-            text   := IniRead(INI_FILE, "History", "Text"   . A_Index)
             pinned := Integer(IniRead(INI_FILE, "History", "Pinned" . A_Index, 0)) = 1
-            text   := StrReplace(text, "\n", "`n")
-            text   := StrReplace(text, "\r", "`r")
+            ; Full text is stored on disk (avoids the ~32KB per-value INI limit
+            ; that used to silently corrupt the History section on large copies).
+            ; Fall back to the INI value (older files / short items).
+            textFile := CLIP_DIR "\" A_Index ".txt"
+            if FileExist(textFile) {
+                text := FileRead(textFile, "UTF-8")
+            } else {
+                text := IniRead(INI_FILE, "History", "Text" . A_Index, "")
+                text := StrReplace(text, "\n", "`n")
+                text := StrReplace(text, "\r", "`r")
+            }
             ; Load binary clipboard data if saved
             clipFile := CLIP_DIR "\" A_Index ".clip"
             clip := ""
@@ -91,6 +105,8 @@ LoadConfig() {
             ClipHistory.Push({text: text, clip: clip, thumb: thumb, isImage: isImage, pinned: pinned, id: NextID++})
         }
     }
+    ; Remove any PNG files in Thumbs not referenced by loaded history
+    PurgeOrphanedThumbs()
 }
 
 SaveConfig() {
@@ -107,25 +123,52 @@ SaveConfig() {
     Loop Files, CLIP_DIR "\*.clip"
         FileDelete(A_LoopFileFullPath)
     Loop ClipHistory.Length {
-        item := ClipHistory[A_Index]
-        safe := StrReplace(item.text, "`n", "\n")
-        safe := StrReplace(safe,      "`r", "\r")
-        IniWrite(safe,            INI_FILE, "History", "Text"   . A_Index)
-        IniWrite(item.pinned?1:0, INI_FILE, "History", "Pinned" . A_Index)
-        IniWrite((item.HasProp("isImage") && item.isImage) ? 1 : 0, INI_FILE, "History", "IsImage" . A_Index)
-        ; Save binary clipboard data
-        if (item.HasProp("clip") && item.clip != "" && !(item.clip is String)) {
-            f := FileOpen(CLIP_DIR "\" A_Index ".clip", "w")
-            f.RawWrite(item.clip)
-            f.Close()
-        }
-        ; Copy thumb to indexed filename so load can find it
-        if (item.HasProp("isImage") && item.isImage && item.HasProp("thumb") && item.thumb != "" && FileExist(item.thumb)) {
-            destThumb := THUMB_DIR "\" A_Index ".png"
-            if (item.thumb != destThumb)
-                FileCopy(item.thumb, destThumb, 1)
+        try {
+            item := ClipHistory[A_Index]
+
+            ; Full text always goes to its own file — INI values have a hard
+            ; ~32KB limit and silently corrupt the whole [History] section
+            ; (which used to wipe pins/other items) when a huge copy overflows it.
+            try {
+                f := FileOpen(CLIP_DIR "\" A_Index ".txt", "w", "UTF-8")
+                f.Write(item.text)
+                f.Close()
+            }
+            ; Keep a small bounded preview in the INI too, just for safety/debugging.
+            preview := SubStr(item.text, 1, 500)
+            safe := StrReplace(preview, "`n", "\n")
+            safe := StrReplace(safe,    "`r", "\r")
+            IniWrite(safe,            INI_FILE, "History", "Text"   . A_Index)
+            IniWrite(item.pinned?1:0, INI_FILE, "History", "Pinned" . A_Index)
+            IniWrite((item.HasProp("isImage") && item.isImage) ? 1 : 0, INI_FILE, "History", "IsImage" . A_Index)
+            ; Save binary clipboard data
+            if (item.HasProp("clip") && item.clip != "" && !(item.clip is String)) {
+                f := FileOpen(CLIP_DIR "\" A_Index ".clip", "w")
+                f.RawWrite(item.clip)
+                f.Close()
+            }
+            ; Copy thumb to indexed filename so load can find it
+            if (item.HasProp("isImage") && item.isImage && item.HasProp("thumb") && item.thumb != "" && FileExist(item.thumb)) {
+                destThumb := THUMB_DIR "\" A_Index ".png"
+                if (item.thumb != destThumb)
+                    FileCopy(item.thumb, destThumb, 1)
+            }
+        } catch {
+            ; Don't let one bad item abort the save of everything else.
+            continue
         }
     }
+}
+
+; Last line of defense: log unexpected errors instead of letting the whole
+; script die (which was also what left the INI in a half-written state).
+OnError(GlobalErrorHandler)
+GlobalErrorHandler(e, mode) {
+    try {
+        FileAppend(FormatTime(, "yyyy-MM-dd HH:mm:ss") " | " e.Message " | " e.What " | line " e.Line "`n",
+            A_ScriptDir "\ClipboardPlus_error.log", "UTF-8")
+    }
+    return true   ; true = suppress the error and keep running
 }
 
 LoadConfig()
@@ -138,7 +181,7 @@ A_TrayMenu.Delete()
 A_TrayMenu.Add("Open Clipboard Plus", (*) => ShowOrRefresh())
 A_TrayMenu.Add("Exit", (*) => ExitApp())
 A_TrayMenu.Default := "Open Clipboard Plus"
-A_IconTip := "Clipboard Plus"
+A_IconTip := "Clipboard Plus v1.1"
 if A_IsCompiled
     TraySetIcon(A_ScriptFullPath, 1)
 else if FileExist(A_ScriptDir "\icon.ico")
@@ -182,10 +225,10 @@ ShowOrRefresh(mx := -1, my := -1) {
 }
 
 SyncPinButton() {
-    global BtnPin, ShowPinned
+    global BtnPin, ShowPinned, HoveredHeaderBtn
     if (BtnPin = "")
         return
-    BtnPin.Opt("Background" (ShowPinned ? "2D3B55" : "1C1C1C"))
+    BtnPin.Opt("Background" HeaderBtnColor("pin", HoveredHeaderBtn = "pin"))
     DllCall("InvalidateRect", "Ptr", BtnPin.Hwnd, "Ptr", 0, "Int", 1)
     DllCall("UpdateWindow",   "Ptr", BtnPin.Hwnd)
 }
@@ -367,9 +410,21 @@ ClipChanged(DataType) {
         return
     if (DllCall("IsClipboardFormatAvailable", "UInt", 15))
         return
-    text := A_Clipboard
+    try {
+        text := A_Clipboard
+    } catch {
+        return
+    }
     if (text = "" || text = LastClipText)
         return
+    ; Windows 11's double-click-anywhere text selection can copy a button's
+    ; own caption (e.g. this app's header emoji buttons) straight to the
+    ; clipboard, bypassing our code entirely. Recognize and ignore that.
+    static OwnUiCaptions := ["📌", "❌", "⚙️", "🪟"]
+    for caption in OwnUiCaptions {
+        if (text = caption)
+            return
+    }
     LastClipText := text
     if (PlainTextMode) {
         A_Clipboard := text
@@ -378,7 +433,7 @@ ClipChanged(DataType) {
     Loop ClipHistory.Length {
         if (ClipHistory[A_Index].text = text) {
             moved := ClipHistory.RemoveAt(A_Index)
-            moved.clip := PlainTextMode ? text : ClipboardAll()
+            moved.clip := PlainTextMode ? text : SafeClipboardAll()
             ClipHistory.InsertAt(1, moved)
             if (ManagerGui != "" && WinExist("ahk_id " ManagerGui.Hwnd))
                 RebuildItems()
@@ -399,11 +454,26 @@ ClipChanged(DataType) {
         if (!removed)
             break
     }
-    clip := PlainTextMode ? text : ClipboardAll()
+    clip := PlainTextMode ? text : SafeClipboardAll()
     ClipHistory.InsertAt(1, {text: text, clip: clip, pinned: false, id: NextID++})
     if (ManagerGui != "" && WinExist("ahk_id " ManagerGui.Hwnd))
         RebuildItems()
     ShowCopyTooltip()
+}
+
+; Capture full clipboard formatting, but bail out to plain-text-only storage
+; if it's unreasonably large or errors — this is what used to crash the script
+; on very large copies.
+SafeClipboardAll() {
+    global MAX_CLIP_BYTES
+    try {
+        clip := ClipboardAll()
+        if (clip.Size > MAX_CLIP_BYTES)
+            return ""   ; too big — caller keeps plain text only, no formatted copy
+        return clip
+    } catch {
+        return ""
+    }
 }
 
 ShowCopyTooltip() {
@@ -426,7 +496,7 @@ BuildGui() {
     global ManagerGui, ScrollGui, MENUBAR_H, LIST_TOP
     global BtnPin, BtnClear, BtnSettings, BtnWinClip
 
-    ManagerGui := Gui("+Resize +MinSize240x200 -MaximizeBox -MinimizeBox -DPIScale", "Clipboard Plus")
+    ManagerGui := Gui("+Resize +MinSize240x200 -MaximizeBox -MinimizeBox -DPIScale", "Clipboard Plus v1.1")
     ManagerGui.BackColor := "1C1C1C"
     ManagerGui.MarginX   := 0
     ManagerGui.MarginY   := 0
@@ -439,22 +509,18 @@ BuildGui() {
     BtnPin := ManagerGui.Add("Text",
         "x0 y0 w" btnW " h" MENUBAR_H " +0x200 +0x80 Center Background1C1C1C cFFFFFF", "📌")
     BtnPin.OnEvent("Click",       (*) => OnBtnPin())
-    BtnPin.OnEvent("DoubleClick",  (*) => OnBtnPin())
 
     BtnClear := ManagerGui.Add("Text",
         "x0 y0 w" btnW " h" MENUBAR_H " +0x200 +0x80 Center Background1C1C1C cFFFFFF", "❌")
     BtnClear.OnEvent("Click",       (*) => OnBtnClear())
-    BtnClear.OnEvent("DoubleClick", (*) => OnBtnClear())
 
     BtnSettings := ManagerGui.Add("Text",
         "x0 y0 w" btnW " h" MENUBAR_H " +0x200 +0x80 Center Background1C1C1C cFFFFFF", "⚙️")
     BtnSettings.OnEvent("Click",       (*) => OnBtnSettings())
-    BtnSettings.OnEvent("DoubleClick", (*) => OnBtnSettings())
 
     BtnWinClip := ManagerGui.Add("Text",
         "x0 y0 w" btnW " h" MENUBAR_H " +0x200 +0x80 Center Background1C1C1C cFFFFFF", "🪟")
     BtnWinClip.OnEvent("Click",       (*) => OnBtnWinClip())
-    BtnWinClip.OnEvent("DoubleClick", (*) => OnBtnWinClip())
 
     ; No separator — menu bar blends into background
     LIST_TOP := MENUBAR_H
@@ -559,6 +625,42 @@ GetScrollH() {
     return NumGet(rc, 12, "Int")
 }
 
+; Windows Text controls only wrap at whitespace. A single long token (URL,
+; long word, no-space blob) will just overflow the box instead of wrapping.
+; A bare line-feed isn't reliably treated as a hard break by the control's
+; own auto-wrap — it can get reflowed/merged with neighboring lines. Real
+; space characters DO work reliably (that's how normal multi-word text
+; already wraps), so insert one every N characters within long tokens.
+WrapLongTokens(text, pxWidth, fontSize) {
+    breakEvery := 50   ; target line length for unbroken words/URLs
+    out := ""
+    Loop Parse, text, "`n" {
+        lineText := A_LoopField
+        outLine := ""
+        Loop Parse, lineText, " ", " " {
+            token := A_LoopField
+            if (token = "") {
+                outLine .= " "
+                continue
+            }
+            if (StrLen(token) > breakEvery) {
+                broken := ""
+                pos := 1
+                len := StrLen(token)
+                while (pos <= len) {
+                    broken .= (broken = "" ? "" : " ") SubStr(token, pos, breakEvery)
+                    pos += breakEvery
+                }
+                outLine .= (outLine = "" ? "" : " ") broken
+            } else {
+                outLine .= (outLine = "" ? "" : " ") token
+            }
+        }
+        out .= (out = "" ? "" : "`n") outLine
+    }
+    return out
+}
+
 CalcTextLines(text, pxWidth, fontSize) {
     charsPerLine := Max(1, Floor(pxWidth / (fontSize * 0.62)))
     totalLines   := 0
@@ -577,8 +679,42 @@ CalcItemHeight(text, pxWidth, fontSize) {
 
 CalcItemHeightFull(text, pxWidth, fontSize) {
     global MIN_ITEM_H
-    lines := CalcTextLines(text, pxWidth, fontSize)
+    lines := Min(10, CalcTextLines(text, pxWidth, fontSize))
     return Max(MIN_ITEM_H, lines * (fontSize + 6) + 24)
+}
+
+; Returns text truncated to fit within maxLines, appending "..." if truncated
+TruncateToLines(text, pxWidth, fontSize, maxLines := 10) {
+    charsPerLine := Max(1, Floor(pxWidth / (fontSize * 0.62)))
+    outputLines  := []
+    totalLines   := 0
+    Loop Parse, text, "`n" {
+        segment   := A_LoopField
+        segChars  := StrLen(segment)
+        segLines  := Max(1, Ceil(segChars / charsPerLine))
+        if (totalLines + segLines >= maxLines) {
+            remaining := maxLines - totalLines
+            if (remaining <= 0)
+                break
+            ; Fit only what remaining lines allow
+            allowed := remaining * charsPerLine
+            if (StrLen(segment) > allowed)
+                segment := SubStr(segment, 1, Max(1, allowed - 3)) "..."
+            outputLines.Push(segment)
+            totalLines += remaining
+            break
+        }
+        outputLines.Push(segment)
+        totalLines += segLines
+    }
+    result := ""
+    for i, ln in outputLines
+        result .= (i > 1 ? "`n" : "") ln
+    ; If original had more content than what we kept, ensure "..." suffix
+    orig := StrReplace(text, "`r", "")
+    if (result != orig && !RegExMatch(result, "\.\.\.$"))
+        result := RTrim(result) "..."
+    return result
 }
 
 TextExceedsBox(text, pxWidth, fontSize) {
@@ -586,16 +722,23 @@ TextExceedsBox(text, pxWidth, fontSize) {
 }
 
 RebuildItems() {
-    global ScrollGui, ItemControls, ScrollOffset, ClipHistory, ShowPinned, ITEM_PAD, ExpandedIds
+    global ScrollGui, ItemControls, ScrollOffset, ClipHistory, ShowPinned, ITEM_PAD, ExpandedIds, HoveredItemId, HoveredExpandBtnId
 
-    ; Hide old controls
+    ; Destroy old controls (not just hide) — hiding accumulates them toward the 8192 control limit
     for ic in ItemControls {
-        for key in ["bg", "lbl", "sep", "expandBtn", "pinIcon"] {
-            if (ic.HasProp(key) && ic.%key% != "")
+        for key in ["sep", "lbl", "expandBtn", "pinIcon", "bg"] {
+            if (ic.HasProp(key) && ic.%key% != "") {
                 try ic.%key%.Visible := false
+                try {
+                    hwnd := ic.%key%.Hwnd
+                    DllCall("DestroyWindow", "Ptr", hwnd)
+                }
+            }
         }
     }
     ItemControls := []
+    HoveredItemId := 0
+    HoveredExpandBtnId := 0
 
     w := GetScrollW()
     h := GetScrollH()
@@ -624,7 +767,7 @@ RebuildItems() {
 }
 
 DrawItem(item, yTop, w) {
-    global ScrollGui, ItemControls, ITEM_PAD, ExpandedIds, MIN_ITEM_H
+    global ScrollGui, ItemControls, ITEM_PAD, ExpandedIds, MIN_ITEM_H, MAX_EXPANDED_CHARS
 
     expandBtnW := 22
     expandBtnH := 16
@@ -633,13 +776,13 @@ DrawItem(item, yTop, w) {
     fontSize   := 9
 
     bgX := ITEM_PAD
-    bgW := w - ITEM_PAD * 2
+    bgW := Max(1, w - ITEM_PAD * 2)
 
-    lblW := bgW - innerL - innerR - expandBtnW - 2
+    lblW := Max(1, bgW - innerL - innerR - expandBtnW - 2)
 
     preview  := StrReplace(item.text, "`r", "")
     preview  := StrReplace(preview,   "`r`n", "`n")
-    fullText := preview
+    fullText := WrapLongTokens(preview, lblW, fontSize)
 
     needsExpand := (!item.HasProp("isImage") || !item.isImage) && TextExceedsBox(fullText, lblW, fontSize)
 
@@ -651,12 +794,27 @@ DrawItem(item, yTop, w) {
         }
     }
 
+    ; Always truncate to what's actually shown — passing the full (possibly huge)
+    ; text as a control caption makes Windows reject control creation outright.
+    displayText := fullText
+    if (isExpanded && needsExpand) {
+        displayText := TruncateToLines(fullText, lblW, fontSize, 10)
+        if (StrLen(displayText) > MAX_EXPANDED_CHARS) {
+            displayText := SubStr(displayText, 1, MAX_EXPANDED_CHARS - 3) "..."
+        }
+    }
+    else if (!isExpanded)
+        displayText := TruncateToLines(fullText, lblW, fontSize, 3)
+
     if (item.HasProp("isImage") && item.isImage)
         itemH := 110   ; fixed thumbnail height
     else
         itemH := isExpanded
-            ? CalcItemHeightFull(fullText, lblW, fontSize)
+            ? CalcItemHeightFull(displayText, lblW, fontSize)
             : CalcItemHeight(fullText, lblW, fontSize)
+
+    ; Safety clamp: Windows rejects controls taller than ~32700px or shorter than 1px
+    itemH := Max(MIN_ITEM_H, Min(itemH, 32700))
 
     h := GetScrollH()
     if (yTop + itemH < 0 || yTop > h)
@@ -690,15 +848,22 @@ DrawItem(item, yTop, w) {
     ; Text label or image thumbnail
     if (item.HasProp("isImage") && item.isImage && item.HasProp("thumb") && item.thumb != "" && FileExist(item.thumb)) {
         ; Show thumbnail — fix height, auto width to preserve aspect ratio
-        thumbH_px := itemH - 16
+        thumbH_px := Max(1, itemH - 16)
         lbl := ScrollGui.Add("Pic",
             "x" bgX+innerL " y" yTop+8 " w-1 h" thumbH_px
             " Background" clrStr, item.thumb)
         DllCall("InvalidateRect", "Ptr", lbl.Hwnd, "Ptr", 0, "Int", 1)
     } else {
-        lbl := ScrollGui.Add("Text",
-            "x" bgX+innerL " y" yTop+8 " w" lblW " h" itemH-16
-            " cE0E0E0 Background" clrStr, fullText)
+        lblH := Max(1, itemH - 16)
+        try {
+            lbl := ScrollGui.Add("Text",
+                "x" bgX+innerL " y" yTop+8 " w" lblW " h" lblH
+                " cE0E0E0 Background" clrStr, displayText)
+        } catch {
+            lbl := ScrollGui.Add("Text",
+                "x" bgX+innerL " y" yTop+8 " w" lblW " h" lblH
+                " cE0E0E0 Background" clrStr, "[Large item — content too big to preview]")
+        }
         lbl.SetFont("s" fontSize, "Segoe UI")
     }
 
@@ -732,12 +897,149 @@ ToggleExpand(id) {
     RebuildItems()
 }
 
+; Lighter tint of the normal card color, used to signal "this is hoverable/clickable"
+ItemCardColor(item, hovered) {
+    if (item.pinned)
+        return hovered ? "3D4E6E" : "2D3B55"
+    else
+        return hovered ? "383838" : "282828"
+}
+
+SetItemHoverState(ic, hovered) {
+    clr := ItemCardColor(ic.item, hovered)
+    ; Paint the background and label first, and flush that paint synchronously
+    ; (UpdateWindow) before touching anything else — otherwise their repaint
+    ; can still be pending when we redraw the icons, and land on top of them
+    ; afterward.
+    for ctrl in [ic.bg, ic.lbl] {
+        if (ctrl = "")
+            continue
+        try {
+            ctrl.Opt("Background" clr)
+            DllCall("InvalidateRect", "Ptr", ctrl.Hwnd, "Ptr", 0, "Int", 1)
+            DllCall("UpdateWindow",   "Ptr", ctrl.Hwnd)
+        }
+    }
+    ; Now update the pin icon's color and redraw both overlapping foreground
+    ; controls last, guaranteed after the background/label paint is done.
+    if (ic.pinIcon != "") {
+        try ic.pinIcon.Opt("Background" clr)
+    }
+    for ctrl in [ic.pinIcon, ic.expandBtn] {
+        if (ctrl = "")
+            continue
+        try {
+            DllCall("InvalidateRect", "Ptr", ctrl.Hwnd, "Ptr", 0, "Int", 1)
+            DllCall("UpdateWindow",   "Ptr", ctrl.Hwnd)
+        }
+    }
+}
+
+SetExpandBtnHoverState(ic, hovered) {
+    if (ic.expandBtn = "")
+        return
+    clr := ItemCardColor(ic.item, hovered)
+    try {
+        ic.expandBtn.Opt("Background" clr)
+        DllCall("InvalidateRect", "Ptr", ic.expandBtn.Hwnd, "Ptr", 0, "Int", 1)
+    }
+}
+
+; Header buttons are normally dark gray, except Pin which turns blue while
+; "Show Only Pinned" is active — hover should lighten whichever is current.
+HeaderBtnColor(name, hovered) {
+    global ShowPinned
+    isActive := (name = "pin" && ShowPinned)
+    if (isActive)
+        return hovered ? "3D4E6E" : "2D3B55"
+    else
+        return hovered ? "2A2A2A" : "1C1C1C"
+}
+
+SetHeaderBtnHoverState(btn, name, hovered) {
+    if (btn = "")
+        return
+    try {
+        btn.Opt("Background" HeaderBtnColor(name, hovered))
+        DllCall("InvalidateRect", "Ptr", btn.Hwnd, "Ptr", 0, "Int", 1)
+    }
+}
+
 ; ============================================================
 ;  MENU BAR — TOOLTIP HOVER
 ; ============================================================
 OnMouseMove(wParam, lParam, msg, hwnd) {
     global ManagerGui, BtnPin, BtnClear, BtnSettings, BtnWinClip, ShowPinned
-    global TooltipLastHwnd
+    global TooltipLastHwnd, ItemControls, HoveredItemId, HoveredExpandBtnId, HoveredHeaderBtn
+
+    ; Header button hover highlight (📌 ❌ ⚙️ 🪟)
+    headerBtns := Map("pin", BtnPin, "clear", BtnClear, "settings", BtnSettings, "winclip", BtnWinClip)
+    newHeaderHover := ""
+    for name, btn in headerBtns {
+        if (btn != "" && hwnd = btn.Hwnd) {
+            newHeaderHover := name
+            break
+        }
+    }
+    if (newHeaderHover != HoveredHeaderBtn) {
+        if (HoveredHeaderBtn != "" && headerBtns.Has(HoveredHeaderBtn))
+            SetHeaderBtnHoverState(headerBtns[HoveredHeaderBtn], HoveredHeaderBtn, false)
+        if (newHeaderHover != "")
+            SetHeaderBtnHoverState(headerBtns[newHeaderHover], newHeaderHover, true)
+        HoveredHeaderBtn := newHeaderHover
+    }
+
+    ; Expand/collapse button — its own independent hover highlight, not the whole card.
+    hitExpandIc := ""
+    for ic in ItemControls {
+        if (ic.HasProp("item") && ic.expandBtn != "" && hwnd = ic.expandBtn.Hwnd) {
+            hitExpandIc := ic
+            break
+        }
+    }
+    newExpandHoverId := (hitExpandIc != "") ? hitExpandIc.item.id : 0
+    if (newExpandHoverId != HoveredExpandBtnId) {
+        if (HoveredExpandBtnId != 0) {
+            for ic in ItemControls {
+                if (ic.HasProp("item") && ic.item.id = HoveredExpandBtnId) {
+                    SetExpandBtnHoverState(ic, false)
+                    break
+                }
+            }
+        }
+        if (hitExpandIc != "")
+            SetExpandBtnHoverState(hitExpandIc, true)
+        HoveredExpandBtnId := newExpandHoverId
+    }
+
+    ; Card hover highlight — deliberately excludes the expand button (handled above)
+    ; so hovering it doesn't also light up the whole card.
+    hitIc := ""
+    for ic in ItemControls {
+        if (!ic.HasProp("item"))
+            continue
+        if ((ic.bg != "" && hwnd = ic.bg.Hwnd)
+            || (ic.lbl != "" && hwnd = ic.lbl.Hwnd)
+            || (ic.pinIcon != "" && hwnd = ic.pinIcon.Hwnd)) {
+            hitIc := ic
+            break
+        }
+    }
+    newHoverId := (hitIc != "") ? hitIc.item.id : 0
+    if (newHoverId != HoveredItemId) {
+        if (HoveredItemId != 0) {
+            for ic in ItemControls {
+                if (ic.HasProp("item") && ic.item.id = HoveredItemId) {
+                    SetItemHoverState(ic, false)
+                    break
+                }
+            }
+        }
+        if (hitIc != "")
+            SetItemHoverState(hitIc, true)
+        HoveredItemId := newHoverId
+    }
+
     if (ManagerGui = "")
         return
     if (hwnd = TooltipLastHwnd)
@@ -804,6 +1106,7 @@ OnMouseWheel(wParam, lParam, msg, hwnd) {
                 continue
             preview := StrReplace(item.text, "`r", "")
             preview := StrReplace(preview,   "`r`n", "`n")
+            preview := WrapLongTokens(preview, textW, 9)
             isExpanded := false
             for eid in ExpandedIds {
                 if (eid = item.id) {
@@ -812,8 +1115,9 @@ OnMouseWheel(wParam, lParam, msg, hwnd) {
                 }
             }
             ih := isExpanded
-                ? CalcItemHeightFull(preview, textW, 9)
+                ? CalcItemHeightFull(TruncateToLines(preview, textW, 9, 10), textW, 9)
                 : CalcItemHeight(preview, textW, 9)
+            ih := Min(ih, 32700)
             totalH += ih + ITEM_PAD
         }
         maxScroll    := Max(0, totalH - h + ITEM_PAD)
@@ -841,10 +1145,10 @@ CenterOnGui(parentGui, dlgW, dlgH) {
 
 ; 📌  Show Only Pinned — highlighted when active
 OnBtnPin() {
-    global ShowPinned, ScrollOffset, BtnPin
+    global ShowPinned, ScrollOffset, BtnPin, HoveredHeaderBtn
     ShowPinned   := !ShowPinned
     ScrollOffset := 0
-    BtnPin.Opt("Background" (ShowPinned ? "2D3B55" : "1C1C1C"))
+    BtnPin.Opt("Background" HeaderBtnColor("pin", HoveredHeaderBtn = "pin"))
     DllCall("InvalidateRect", "Ptr", BtnPin.Hwnd, "Ptr", 0, "Int", 1)
     DllCall("UpdateWindow",   "Ptr", BtnPin.Hwnd)
     ; Update tooltip immediately while still hovering
@@ -876,7 +1180,7 @@ OnBtnClear() {
 }
 
 DoClearAll() {
-    global ClipHistory, ScrollOffset
+    global ClipHistory, ScrollOffset, THUMB_DIR
     newHistory := []
     for item in ClipHistory {
         if (item.pinned)
@@ -886,6 +1190,8 @@ DoClearAll() {
     }
     ClipHistory  := newHistory
     ScrollOffset := 0
+    ; Purge any leftover PNG files in Thumbs that no longer belong to any item
+    PurgeOrphanedThumbs()
     RebuildItems()
 }
 
@@ -893,7 +1199,7 @@ DoClearAll() {
 OnBtnSettings() {
     global ManagerGui, PlainTextMode, KeepOpen, MaxItems
     ToolTip("")
-    dlgW := 280, dlgH := 160
+    dlgW := 280, dlgH := 190
     pad  := 24    ; left/right padding
     ctlW := dlgW - pad * 2   ; 232px — all controls same width & x
     dlg := Gui("+Owner" ManagerGui.Hwnd " -MaximizeBox -MinimizeBox", "Settings")
@@ -908,11 +1214,15 @@ OnBtnSettings() {
     ; "Set Maximum Items" row: label + edit on same line
     lblMax := dlg.Add("Text",  "x" pad " y76 w160 h22 +0x200", "Set Maximum Items")
     txtMax := dlg.Add("Edit",  "x" pad+160 " y74 w" ctlW-160 " c000000", MaxItems)
-    btnSave    := dlg.Add("Button", "x" pad " y112 w" (ctlW//2 - 4) " h28", "Save")
-    btnDiscard := dlg.Add("Button", "x" pad+(ctlW//2+4) " y112 w" (ctlW//2 - 4) " h28", "Discard")
+    btnExport := dlg.Add("Button", "x" pad " y106 w" (ctlW//2 - 4) " h28", "Export Backup")
+    btnImport := dlg.Add("Button", "x" pad+(ctlW//2+4) " y106 w" (ctlW//2 - 4) " h28", "Import Backup")
+    btnSave    := dlg.Add("Button", "x" pad " y142 w" (ctlW//2 - 4) " h28", "Save")
+    btnDiscard := dlg.Add("Button", "x" pad+(ctlW//2+4) " y142 w" (ctlW//2 - 4) " h28", "Discard")
     closeDlg := () => (ManagerGui.Opt("-Disabled"), dlg.Destroy())
     btnSave.OnEvent("Click", (*) => SaveSettings(dlg, cbPlain, cbKeep, txtMax, closeDlg))
     btnDiscard.OnEvent("Click", (*) => closeDlg())
+    btnExport.OnEvent("Click", (*) => ExportBackup(dlg))
+    btnImport.OnEvent("Click", (*) => ImportBackup(dlg, closeDlg))
     dlg.OnEvent("Close",  (*) => closeDlg())
     dlg.OnEvent("Escape", (*) => closeDlg())
     ManagerGui.Opt("+Disabled")
@@ -926,6 +1236,64 @@ SaveSettings(dlg, cbPlain, cbKeep, txtMax, closeDlg) {
     n := Integer(txtMax.Value)
     if (n >= 1 && n <= 200)
         MaxItems := n
+    closeDlg()
+}
+
+; ============================================================
+;  BACKUP — EXPORT / IMPORT (pinned + unpinned, full text, images)
+; ============================================================
+; A plain .ini can't safely hold this data on its own — full clip text and
+; binary clipboard/image data are stored as separate files precisely because
+; INI values are capped at ~32KB (that's what used to corrupt the history and
+; wipe pins on large copies). So a backup bundles the INI *and* its data
+; folder together into a single .zip, which preserves everything losslessly.
+ExportBackup(dlg) {
+    global INI_FILE, CLIP_DIR, ManagerGui
+    SaveConfig()   ; flush current in-memory state (including pins) to disk first
+    defaultName := "ClipboardPlus_Backup_" FormatTime(, "yyyyMMdd_HHmmss") ".zip"
+    try savePath := FileSelect("S16", defaultName, "Export Clipboard Plus Backup", "Zip Files (*.zip)")
+    if (!IsSet(savePath) || savePath = "")
+        return
+    if !InStr(savePath, ".zip")
+        savePath .= ".zip"
+    try FileDelete(savePath)
+    psCmd := "Compress-Archive -Path '" INI_FILE "','" CLIP_DIR "' -DestinationPath '" savePath "' -Force"
+    RunWait('powershell.exe -NoProfile -WindowStyle Hidden -Command "' psCmd '"', , "Hide")
+    if FileExist(savePath)
+        MsgBox("Backup exported to:`n" savePath, "Export Complete", "Iconi")
+    else
+        MsgBox("Export failed. Please try again.", "Export Failed", "IconX")
+}
+
+ImportBackup(dlg, closeDlg) {
+    global INI_FILE, CLIP_DIR, ManagerGui
+    try zipPath := FileSelect(1, , "Import Clipboard Plus Backup", "Zip Files (*.zip)")
+    if (!IsSet(zipPath) || zipPath = "")
+        return
+    result := MsgBox("Importing will replace your current clipboard history, including pinned items. Continue?",
+        "Import Backup", "YesNo Icon!")
+    if (result != "Yes")
+        return
+    tempDir := A_Temp "\ClipboardPlusImport_" A_TickCount
+    try DirCreate(tempDir)
+    psCmd := "Expand-Archive -Path '" zipPath "' -DestinationPath '" tempDir "' -Force"
+    RunWait('powershell.exe -NoProfile -WindowStyle Hidden -Command "' psCmd '"', , "Hide")
+    importedIni  := tempDir "\ClipboardManager.ini"
+    importedData := tempDir "\ClipboardData"
+    if !FileExist(importedIni) {
+        MsgBox("That file doesn't look like a valid Clipboard Plus backup.", "Import Failed", "IconX")
+        try DirDelete(tempDir, true)
+        return
+    }
+    try FileDelete(INI_FILE)
+    try FileCopy(importedIni, INI_FILE, true)
+    try DirDelete(CLIP_DIR, true)
+    if DirExist(importedData)
+        try DirCopy(importedData, CLIP_DIR, true)
+    try DirDelete(tempDir, true)
+    LoadConfig()
+    RebuildItems()
+    MsgBox("Backup imported successfully.", "Import Complete", "Iconi")
     closeDlg()
 }
 
@@ -1030,6 +1398,23 @@ DeleteItem(item) {
 DeleteItemThumb(item) {
     if (item.HasProp("isImage") && item.isImage && item.HasProp("thumb") && item.thumb != "")
         try FileDelete(item.thumb)
+}
+
+; Delete any PNG files in THUMB_DIR not referenced by any current ClipHistory item
+PurgeOrphanedThumbs() {
+    global THUMB_DIR, ClipHistory
+    if !DirExist(THUMB_DIR)
+        return
+    ; Collect all thumb paths still in use
+    usedThumbs := Map()
+    for item in ClipHistory {
+        if (item.HasProp("thumb") && item.thumb != "")
+            usedThumbs[item.thumb] := true
+    }
+    Loop Files, THUMB_DIR "\*.png" {
+        if !usedThumbs.Has(A_LoopFileFullPath)
+            try FileDelete(A_LoopFileFullPath)
+    }
 }
 
 MoveItem(item, delta) {
